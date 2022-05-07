@@ -1,12 +1,15 @@
 from typing import List, Tuple
+import unittest
+
 import numpy as np
 import torch
 from torch.utils._pytree import tree_map
 from torch.testing._internal.common_utils import TestCase, run_tests, numpy_to_torch_dtype_dict
 from torch.testing._internal.common_device_type import ops, instantiate_device_type_tests
 from torch.testing._internal.common_methods_invocations import op_db, DecorateInfo
-import unittest
+from torch._decomp import decomposition_table
 
+aten = torch.ops.aten
 
 # 1) Mock backend
 
@@ -75,42 +78,42 @@ def numpy_to_torch(t):
     else:
         return torch.from_numpy(t)
 
-@register_func("add.Tensor", np_tensor_backend_impl)
+@register_func(aten.add.Tensor, np_tensor_backend_impl)
 @fix_binary_type_promotion
 def np_tensor_add_impl(x, y):
     return NPTensor(maybe_unwrap(x) + maybe_unwrap(y))
 
-@register_func("sub.Tensor", np_tensor_backend_impl)
+@register_func(aten.sub.Tensor, np_tensor_backend_impl)
 @fix_binary_type_promotion
 def np_tensor_sub_impl(x, y):
     return NPTensor(maybe_unwrap(x) - maybe_unwrap(y))
 
-@register_func("rsub.Scalar", np_tensor_backend_impl)
+@register_func(aten.rsub.Scalar, np_tensor_backend_impl)
 @fix_binary_type_promotion
 def np_tensor_rsub_impl(x, y):
     return NPTensor(maybe_unwrap(y) - maybe_unwrap(x))
 
-@register_func("mul.Tensor", np_tensor_backend_impl)
+@register_func(aten.mul.Tensor, np_tensor_backend_impl)
 @fix_binary_type_promotion
 def np_tensor_mul_impl(x, y):
     return NPTensor(maybe_unwrap(x) * maybe_unwrap(y))
 
-@register_func("div.Tensor", np_tensor_backend_impl)
+@register_func(aten.div.Tensor, np_tensor_backend_impl)
 @fix_binary_type_promotion
 def np_tensor_div_impl(x, y):
     return NPTensor(maybe_unwrap(x) / maybe_unwrap(y))
 
-@register_func("view.default", np_tensor_backend_impl)
+@register_func(aten.view.default, np_tensor_backend_impl)
 def np_tensor_view_impl(x, shape):
     ret = x.arr.view()
     ret.shape = shape
     return NPTensor(ret)
 
-@register_func("permute.default", np_tensor_backend_impl)
+@register_func(aten.permute.default, np_tensor_backend_impl)
 def np_tensor_permute_impl(x, perm):
     return NPTensor(np.transpose(x.arr, axes=perm))
 
-@register_func("pow.Tensor_Scalar", np_tensor_backend_impl)
+@register_func(aten.pow.Tensor_Scalar, np_tensor_backend_impl)
 def np_tensor_pow_impl(x, a):
     ret = maybe_unwrap(x) ** maybe_unwrap(a)
     if x.arr.dtype.type == np.float32:
@@ -118,11 +121,11 @@ def np_tensor_pow_impl(x, a):
         ret = ret.astype(dtype=np.float32)
     return NPTensor(ret)
 
-@register_func("sum.default", np_tensor_backend_impl)
+@register_func(aten.sum.default, np_tensor_backend_impl)
 def np_tensor_sum_default_impl(x, keepdims=False):
     return NPTensor(np.sum(x.arr, keepdims=keepdims))
 
-@register_func("sum.dim_IntList", np_tensor_backend_impl)
+@register_func(aten.sum.dim_IntList, np_tensor_backend_impl)
 def np_tensor_sum_dim_IntList_impl(x, dims, keepdims=False):
     if x.arr.ndim == 0:
         ret = x.arr
@@ -130,11 +133,11 @@ def np_tensor_sum_dim_IntList_impl(x, dims, keepdims=False):
         ret = np.sum(x.arr, axis=tuple(dims), keepdims=keepdims)
     return NPTensor(ret)
 
-@register_func("gt.Scalar", np_tensor_backend_impl)
+@register_func(aten.gt.Scalar, np_tensor_backend_impl)
 def np_tensor_gt_impl(x, y):
     return NPTensor(maybe_unwrap(x) > maybe_unwrap(y))
 
-@register_func("reciprocal.default", np_tensor_backend_impl)
+@register_func(aten.reciprocal.default, np_tensor_backend_impl)
 def np_tensor_reciprocal_impl(x):
     ret = 1 / x.arr
     if x.arr.dtype.type == np.float32:
@@ -142,32 +145,51 @@ def np_tensor_reciprocal_impl(x):
         ret = ret.astype(dtype=np.float32)
     return NPTensor(ret)
 
-@register_func("exp.default", np_tensor_backend_impl)
+@register_func(aten.exp.default, np_tensor_backend_impl)
 def np_tensor_exp_impl(x):
     return NPTensor(np.exp(x.arr))
 
-@register_func("mm.default", np_tensor_backend_impl)
+@register_func(aten.mm.default, np_tensor_backend_impl)
 def np_tensor_mm_impl(x, y):
     return NPTensor(maybe_unwrap(x) @ maybe_unwrap(y))
 
-@register_func("squeeze.dim", np_tensor_backend_impl)
+@register_func(aten.squeeze.dim, np_tensor_backend_impl)
 def np_tensor_squeeze_impl(x, dim):
     return NPTensor(x.arr.squeeze(dim))
 
-@register_func("unsqueeze.default", np_tensor_backend_impl)
+@register_func(aten.unsqueeze.default, np_tensor_backend_impl)
 def np_tensor_unsqueeze_impl(x, dim):
     return NPTensor(np.expand_dims(x.arr, dim))
 
-@register_func("ones_like.default", np_tensor_backend_impl)
+@register_func(aten.ones_like.default, np_tensor_backend_impl)
 def np_tensor_ones_like_impl(x, dtype, layout, device, pin_memory, memory_format):
     # TODO: do we care about the other arguments
     return NPTensor(np.ones_like(x.arr, dtype=torch_to_numpy_dtype_dict_int(dtype)))
 
-@register_func("detach.default", np_tensor_backend_impl)
+@register_func(aten.detach.default, np_tensor_backend_impl)
 def np_tensor_detach_impl(x):
     # To the backend, detach is simply a view
     return NPTensor(x.arr.view())
 
+@register_func(aten.to.dtype, np_tensor_backend_impl)
+def np_tensor_to_dtype_impl(x, dtype):
+    # To the backend, detach is simply a view
+    ret = x.arr.astype(dtype=torch_to_numpy_dtype_dict_int(dtype))
+    return NPTensor(ret)
+
+# For l1 loss (instead of mse loss)
+
+@register_func(aten.abs.default, np_tensor_backend_impl)
+def np_tensor_abs_default_impl(x):
+    return NPTensor(np.abs(x.arr))
+
+@register_func(aten.mean.default, np_tensor_backend_impl)
+def np_tensor_mean_default_impl(x):
+    return NPTensor(np.mean(x.arr))
+
+@register_func(aten.sign.default, np_tensor_backend_impl)
+def np_tensor_mean_default_impl(x):
+    return NPTensor(np.sign(x.arr))
 
 # 2) Decompositions
 
@@ -177,23 +199,23 @@ def np_tensor_detach_impl(x):
 
 decompositions = dict()
 
-@register_func("relu.default", decompositions)
+@register_func(aten.relu.default, decompositions)
 def relu(x):
     return x * (x > 0)
 
-@register_func("addmm.default", decompositions)
+@register_func(aten.addmm.default, decompositions)
 def addmm(bias, a, b):
     return torch.mm(a, b) + bias
 
-@register_func("sigmoid.default", decompositions)
+@register_func(aten.sigmoid.default, decompositions)
 def sigmoid(x):
     return 1 / (1 + torch.exp(x * -1))
 
-@register_func("sigmoid_backward.default", decompositions)
+@register_func(aten.sigmoid_backward.default, decompositions)
 def sigmoid_backward(grad_out, result):
     return grad_out * result * (1 - result)
 
-@register_func("mse_loss.default", decompositions)
+@register_func(aten.mse_loss.default, decompositions)
 def mse_loss(x, y, reduction="mean"):
     if reduction == "none" or reduction == 0:
         return (x - y)**2
@@ -206,7 +228,7 @@ def mse_loss(x, y, reduction="mean"):
         assert False, (
             f"Expected 'reduction' to be one of {allowed_reductions}, but got: {reduction}")
 
-@register_func("mse_loss_backward.default", decompositions)
+@register_func(aten.mse_loss_backward.default, decompositions)
 def mse_loss_backward(grad_out, self, target, reduction):
     def unsqueeze_multiple(x, nr_times):
         for _ in range(nr_times):
@@ -223,11 +245,11 @@ def mse_loss_backward(grad_out, self, target, reduction):
 
     return  2 * (self - target) * ret
 
-@register_func("threshold_backward.default", decompositions)
+@register_func(aten.threshold_backward.default, decompositions)
 def threshold_backward(grad_out, self, threshold):
     return grad_out * (self > threshold)
 
-@register_func("t.default", decompositions)
+@register_func(aten.t.default, decompositions)
 def t(x):
     if x.ndim <= 1:
         return x
@@ -283,10 +305,12 @@ class NPTensorWrapper(torch.Tensor):
             else:
                 return t
 
-        if func.__name__ in decompositions:
-            return decompositions[func.__name__](*args, **kwargs)
-        elif func.__name__ in np_tensor_backend_impl:
-            return tree_map(wrap, np_tensor_backend_impl[func.__name__](*tree_map(unwrap, args), **tree_map(unwrap, kwargs)))
+        if func in np_tensor_backend_impl:
+            return tree_map(wrap, np_tensor_backend_impl[func](*tree_map(unwrap, args), **tree_map(unwrap, kwargs)))
+        elif func in decompositions:
+            return decompositions[func](*args, **kwargs)
+        elif func in decomposition_table:
+            return decomposition_table[func](*args, **kwargs)
         else:
             raise NotImplementedError(f"Backend has not implemented {func.__name__}")
 
@@ -384,6 +408,7 @@ class NPTensorTest(TestCase):
                 self.linear2 = nn.Linear(10, 10)
                 self.linear3 = nn.Linear(10, 1)
                 self.relu = nn.ReLU()
+                self.gelu = nn.GELU()
 
             def forward(self, x):
                 x = self.linear1(x)
@@ -405,7 +430,7 @@ class NPTensorTest(TestCase):
         losses = []
         for _ in range(N_ITER):
             out = model(train_X)
-            loss = F.mse_loss(out, train_y)
+            loss = F.l1_loss(out, train_y)
             loss.backward()
             sgd.step()
             sgd.zero_grad()
@@ -435,6 +460,7 @@ class NPTensorTest(TestCase):
         # Decompositions
         ('sigmoid',''),
         ('nn.functional.mse_loss',''),
+        ('nn.functional.l1_loss',''),
     ]), allowed_dtypes=(torch.float,))
     @skipOps('NPTensorTest', 'test_np_tensor_parity', {
         # Need to accept `alpha` param
