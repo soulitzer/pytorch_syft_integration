@@ -1,358 +1,242 @@
-from typing import Dict, List, Tuple
-from collections.abc import Iterable
+from typing import List, Tuple
 import numpy as np
-
 import torch
 from torch.utils._pytree import tree_map
-from torch.testing._internal.common_utils import TestCase, run_tests
-from torch.testing._internal.logging_tensor import no_dispatch
-
-from collections import namedtuple
-
-
-# What are all the layers to this?
-# --------------------------------
-# NPTensorWrapper: Interface to the rest of PyTorch (e.g. Python frontend, transforms like Autograd)
-#                  Given `func` calls into the corresponding function implemented by the backend
-#                  which is expected to have a torch-like interface (i.e. ops match the semantics of the
-#                  corresponding PyTorch op).
-# Decomposition  : Lowers higher-level PyTorch ops to a smaller set of more primitive PyTorch ops.
-# NPTensor       : Wraps around np.ndarray to provide a torch-like interface
-# np.ndarray     : Backend implementation
-
-# Table of contents
-# -----------------
-# 0) Helper functions
-# 1) Operators
-#   1.1) Register operators that call straight into primitive backend operations (prims)
-#   1.2) Register decompositions that call into other "composite" operators as well as prims
-#   1.3) Small testing helper function for collecting example runs
-# 2) Mock backend (backend by numpy array but implements torch semantics)
-# 3) Subclass wrapping backend
-# 4) XOR Example
-# 5) Testing our implemented operators/decomopsition using collected examples runs from (1.3)
-
-# To Do
-# -----
-# - dtypes and casting
-# - interaction with parameter
-# - inplace (used by optimizers)
-#   - inplace a subclass into a non-subclass (what does the backend do here?)
-# - view tests
+from torch.testing._internal.common_utils import TestCase, run_tests, numpy_to_torch_dtype_dict
+from torch.testing._internal.common_device_type import ops, instantiate_device_type_tests
+from torch.testing._internal.common_methods_invocations import op_db, DecorateInfo
+import unittest
 
 
-# 0) Helpers
+# 1) Mock backend
 
-def make_tuple(outs):
-    return (outs,) if not isinstance(outs, Iterable) or isinstance(outs, torch.Tensor) else tuple(outs)
+# NPTensor implements an tensor-like interface backed by NumPy arrays. We try to follow
+# torch semantics as closely as possible because the layers above rely on that behavior.
 
-def contig_strides_from_shape(shape):
-    return torch.zeros(shape).stride()
+class NPTensor():
+    def __init__(self, arr):
+        self.arr = arr  # TODO: maybe not do this?
 
-# From torch/testing/_internal/common_utils.py
-numpy_to_torch_dtype_dict = {
-    np.bool       : torch.bool,
-    np.uint8      : torch.uint8,
-    np.int8       : torch.int8,
-    np.int16      : torch.int16,
-    np.int32      : torch.int32,
-    np.int64      : torch.int64,
-    np.float16    : torch.float16,
-    np.float32    : torch.float32,
-    np.float64    : torch.float64,
-    np.complex64  : torch.complex64,
-    np.complex128 : torch.complex128
-}
-torch_to_numpy_dtype_dict = {v: k for k, v in numpy_to_torch_dtype_dict.items()}
+    def __repr__(self):
+        return f"NPTensor(arr={repr(self.arr)})"
 
-# Uh oh, why are we getting ints?
-def torch_to_numpy_dtype_dict_int(dtype_int):
-    if dtype_int == 6:
-        return np.float32  # Not sure if this is even the right one
-    else:
-        assert False, f"got: {dtype_int=}"
+    def publish(self):
+        return self.arr
 
-# 1) Operators
+np_tensor_backend_impl = dict()
 
-# Maps torch op names to operators that our backend has implemented
-all_funcs = dict()
-
-def register_func(name):
+def register_func(name, ns):
     # Helpful decorator to colocate registration and definition
     def register_func_inner(f):
-        assert name not in all_funcs, f"{name} has already been registered"
-        all_funcs[name] = f
+        assert name not in ns, f"{name} has already been registered"
+        ns[name] = f
         return f
     return register_func_inner
 
-# 1.1) Register adapters for numpy backend
+def maybe_unwrap(arg):
+    assert isinstance(arg, np.ndarray) or isinstance(arg, NPTensor) or \
+        isinstance(arg, float) or isinstance(arg, int)
+    return arg.arr if isinstance(arg, NPTensor) else arg
 
-# These simply just redispatch
-@register_func("add.Tensor")
-def add(x, y):
-    return x + y
+def fix_binary_type_promotion(f):
+    # numpy and torch do binary type promotion differently
+    expected_dtypes = (
+        (np.int64, np.float32, np.float32),  # numpy promotes to np.float64
+    )
 
-@register_func("mul.Tensor")
-def mul(x, y):
-    # NB: Explicitly call __mul__ to make sure NPTensor (and not numpy) handles the call
-    if isinstance(x, np.ndarray):
-        return y.__mul__(x)
+    def check_dtype(x, y, lhs, rhs):
+        # HACK: if lhs/rhs are int, make it a numpy array, so that we can check dtype
+        # this might not be the right way to do it
+        x = np.array(x) if isinstance(x, int) or isinstance(x, float) else maybe_unwrap(x)
+        y = np.array(y) if isinstance(y, int) or isinstance(y, float) else maybe_unwrap(y)
+        return x.dtype.type == lhs and y.dtype.type == rhs
+
+    def wrapper(x, y):
+        ret = f(x, y)
+        for lhs, rhs, expected in expected_dtypes:
+            if check_dtype(x, y, lhs, rhs) or check_dtype(y, x, lhs, rhs):
+                ret = NPTensor(ret.arr.astype(dtype=expected))
+        return ret
+
+    return wrapper
+
+torch_to_numpy_dtype_dict = {v: k for k, v in numpy_to_torch_dtype_dict.items()}
+
+def torch_to_numpy_dtype_dict_int(dtype_int):
+    if dtype_int == 6:
+        return np.float32
     else:
-        out = x.__mul__(y)
-        return out
+        assert False, f"got: {dtype_int=}"
 
-@register_func("view.default")
-def view(x, shape):
-    return x.view(shape)
+def numpy_to_torch(t):
+    # Replacement for torch.from_numpy that actually handles scalars
+    if np.isscalar(t):
+        return torch.tensor(t)
+    else:
+        return torch.from_numpy(t)
 
-@register_func("exp.default")
-def exp(x):
-    return x.exp()
+@register_func("add.Tensor", np_tensor_backend_impl)
+@fix_binary_type_promotion
+def np_tensor_add_impl(x, y):
+    return NPTensor(maybe_unwrap(x) + maybe_unwrap(y))
 
-@register_func("sum.dim_IntList")
-def sum(x, dims, keepdims=False):
-    return x.sum(dims, keepdims)
+@register_func("sub.Tensor", np_tensor_backend_impl)
+@fix_binary_type_promotion
+def np_tensor_sub_impl(x, y):
+    return NPTensor(maybe_unwrap(x) - maybe_unwrap(y))
 
-@register_func("mm.default")
-def mm(x, y):
-    return x @ y
+@register_func("rsub.Scalar", np_tensor_backend_impl)
+@fix_binary_type_promotion
+def np_tensor_rsub_impl(x, y):
+    return NPTensor(maybe_unwrap(y) - maybe_unwrap(x))
 
-@register_func("squeeze.dim")
-def squeeze(x, dim):
-    return x.squeeze(dim)
+@register_func("mul.Tensor", np_tensor_backend_impl)
+@fix_binary_type_promotion
+def np_tensor_mul_impl(x, y):
+    return NPTensor(maybe_unwrap(x) * maybe_unwrap(y))
 
-@register_func("unsqueeze.default")
-def unsqueeze(x, dim):
-    return x.unsqueeze(dim)
+@register_func("div.Tensor", np_tensor_backend_impl)
+@fix_binary_type_promotion
+def np_tensor_div_impl(x, y):
+    return NPTensor(maybe_unwrap(x) / maybe_unwrap(y))
 
-@register_func("ones_like.default")  # Maybe this shouldn't be a method
-def ones_like(x, dtype, layout, device, pin_memory, memory_format):
-    # TODO: what do we do with all these arguments?
-    return x.ones_like(dtype=dtype)
+@register_func("view.default", np_tensor_backend_impl)
+def np_tensor_view_impl(x, shape):
+    ret = x.arr.view()
+    ret.shape = shape
+    return NPTensor(ret)
 
-# @register_func("_to_copy.default")
-# def _to_copy(x, dtype):
-#     pass
+@register_func("permute.default", np_tensor_backend_impl)
+def np_tensor_permute_impl(x, perm):
+    return NPTensor(np.transpose(x.arr, axes=perm))
 
-# 1.2) Register decompositions
+@register_func("pow.Tensor_Scalar", np_tensor_backend_impl)
+def np_tensor_pow_impl(x, a):
+    ret = maybe_unwrap(x) ** maybe_unwrap(a)
+    if x.arr.dtype.type == np.float32:
+        # Correct type promotion to match torch
+        ret = ret.astype(dtype=np.float32)
+    return NPTensor(ret)
 
-# These redispatch into more primitive ops, e.g. sigmoid -> exp
-# This means that the backend does not have to directly support all of these
+@register_func("sum.default", np_tensor_backend_impl)
+def np_tensor_sum_default_impl(x, keepdims=False):
+    return NPTensor(np.sum(x.arr, keepdims=keepdims))
 
-@register_func("relu.default")
+@register_func("sum.dim_IntList", np_tensor_backend_impl)
+def np_tensor_sum_dim_IntList_impl(x, dims, keepdims=False):
+    if x.arr.ndim == 0:
+        ret = x.arr
+    else:
+        ret = np.sum(x.arr, axis=tuple(dims), keepdims=keepdims)
+    return NPTensor(ret)
+
+@register_func("gt.Scalar", np_tensor_backend_impl)
+def np_tensor_gt_impl(x, y):
+    return NPTensor(maybe_unwrap(x) > maybe_unwrap(y))
+
+@register_func("reciprocal.default", np_tensor_backend_impl)
+def np_tensor_reciprocal_impl(x):
+    ret = 1 / x.arr
+    if x.arr.dtype.type == np.float32:
+        # Correct type promotion to match torch
+        ret = ret.astype(dtype=np.float32)
+    return NPTensor(ret)
+
+@register_func("exp.default", np_tensor_backend_impl)
+def np_tensor_exp_impl(x):
+    return NPTensor(np.exp(x.arr))
+
+@register_func("mm.default", np_tensor_backend_impl)
+def np_tensor_mm_impl(x, y):
+    return NPTensor(maybe_unwrap(x) @ maybe_unwrap(y))
+
+@register_func("squeeze.dim", np_tensor_backend_impl)
+def np_tensor_squeeze_impl(x, dim):
+    return NPTensor(x.arr.squeeze(dim))
+
+@register_func("unsqueeze.default", np_tensor_backend_impl)
+def np_tensor_unsqueeze_impl(x, dim):
+    return NPTensor(np.expand_dims(x.arr, dim))
+
+@register_func("ones_like.default", np_tensor_backend_impl)
+def np_tensor_ones_like_impl(x, dtype, layout, device, pin_memory, memory_format):
+    # TODO: do we care about the other arguments
+    return NPTensor(np.ones_like(x.arr, dtype=torch_to_numpy_dtype_dict_int(dtype)))
+
+@register_func("detach.default", np_tensor_backend_impl)
+def np_tensor_detach_impl(x):
+    # To the backend, detach is simply a view
+    return NPTensor(x.arr.view())
+
+
+# 2) Decompositions
+
+# Decomposing ops into more primitive ones reduces the number a backend will
+# need to implement. Eventually torch should provide a set of "official"
+# decompositions so we wouldn't need to write them ourselves here.
+
+decompositions = dict()
+
+@register_func("relu.default", decompositions)
 def relu(x):
     return x * (x > 0)
 
-@register_func("addmm.default")
+@register_func("addmm.default", decompositions)
 def addmm(bias, a, b):
-    return a @ b + bias
+    return torch.mm(a, b) + bias
 
-@register_func("sigmoid.default")
+@register_func("sigmoid.default", decompositions)
 def sigmoid(x):
-    return 1 / (1 + (x * -1).exp())
+    return 1 / (1 + torch.exp(x * -1))
 
-@register_func("sigmoid_backward.default")
-def sigmoid_backward(grad_out, x):
-    return grad_out * sigmoid(x) * (1 - sigmoid(x))
+@register_func("sigmoid_backward.default", decompositions)
+def sigmoid_backward(grad_out, result):
+    return grad_out * result * (1 - result)
 
-@register_func("detach.default")
-def detach(x):
-    # To the backend, detach is simply a view
-    return x.alias()
-
-@register_func("mse_loss.default")
+@register_func("mse_loss.default", decompositions)
 def mse_loss(x, y, reduction="mean"):
-    if reduction == "none":
+    if reduction == "none" or reduction == 0:
         return (x - y)**2
-    elif reduction == "sum":
-        return ((x - y)**2).sum()
-    elif reduction == "mean":
+    elif reduction == "mean" or reduction == 1:
         return ((x - y)**2).sum() / x.numel()
+    elif reduction == "sum" or reduction == 2:
+        return ((x - y)**2).sum()
     else:
         allowed_reductions = ("none", "mean", "sum")
         assert False, (
             f"Expected 'reduction' to be one of {allowed_reductions}, but got: {reduction}")
 
-@register_func("mse_loss_backward.default")
+@register_func("mse_loss_backward.default", decompositions)
 def mse_loss_backward(grad_out, self, target, reduction):
     def unsqueeze_multiple(x, nr_times):
-        # NB: Make sure broadcasting works -
-        #     forward always reduces out to a scalar, but in NPTensor, .arr should have at least dim of 1
         for _ in range(nr_times):
             x = x.unsqueeze(-1)
         return x
     if reduction == 0:    # Reduction::None
         ret = grad_out
     elif reduction == 1:  # Reduction::Mean
-        ret = unsqueeze_multiple(grad_out, self.ndim() - grad_out.ndim()) / self.numel()
+        ret = unsqueeze_multiple(grad_out, self.ndim - grad_out.ndim) / self.numel()
     elif reduction == 2:  # Reduction::Sum
-        ret = unsqueeze_multiple(grad_out, self.ndim() - grad_out.ndim())
+        ret = unsqueeze_multiple(grad_out, self.ndim - grad_out.ndim)
     else:
-        assert False, f"This is a bug. Got reduction: {reduction}"
+        assert False
 
     return  2 * (self - target) * ret
 
-@register_func("threshold_backward.default")
+@register_func("threshold_backward.default", decompositions)
 def threshold_backward(grad_out, self, threshold):
     return grad_out * (self > threshold)
 
-@register_func("t.default")
+@register_func("t.default", decompositions)
 def t(x):
-    if x.ndim() == 0:
-        assert False, "Huh? Scalars .arr should not exist"
-    elif x.ndim() == 1:
+    if x.ndim <= 1:
         return x
-    elif x.ndim() == 2:
+    elif x.ndim == 2:
         return x.permute((1, 0))
     else:
         assert False
 
-
-# 1.3) Testing for Operators:
-
-# Helper for collecting example runs into a dict
-
-OpInputOutput = namedtuple("OpInputOutput", "op_name input_args input_kwargs outputs")
-op_in_out_examples: Dict[str, OpInputOutput] = dict()
-
-def collect_example_run(op_name, args, kwargs, outs) -> None:
-    outs = (outs,) if not isinstance(outs, Iterable) or isinstance(outs, torch.Tensor) else tuple(outs)
-    new_example = OpInputOutput(op_name, args, kwargs, outs)
-    op_in_out_examples[op_name] = op_in_out_examples.get(op_name, []) + [new_example]
-
-
-# 2) Mock backend
-
-class NPTensor():
-    # This is a "backend" wraps a numpy array and implements a tensor-like interface
-    #
-    # Notes:
-    # - The semantics of this object will try to follow that of torch. The idea is that
-    #   decompositions (mapping from torch ops to more primtive torch ops) will eventually
-    #   be something that PyTorch should eventually provide as well so that shouldn't be the
-    #   place where the numpy-torch translation happens.
-    # - Autograd-aware ops like detach should not exist here
-    # - This "Tensor" supports operations between NPTensor and unwrapped numpy array
-    #
-    # TODO:
-    # - shape/view operators (NPTenosrWrapper may need metadata sync)
-    # - casting operators
-    # - we only have methods, what about functions?
-
-    def __init__(self, arr):
-        self.arr = np.atleast_1d(arr)  # TODO: maybe not do this?
-        self.public_shape = lambda: arr.shape
-        self.public_dtype = lambda: str(arr.dtype)
-
-    def maybe_unwrap(self, arg):
-        assert isinstance(arg, np.ndarray) or isinstance(arg, NPTensor) or \
-            isinstance(arg, float) or isinstance(arg, int)
-        return arg.arr if isinstance(arg, NPTensor) else arg
-
-    def __add__(self, other):
-        return NPTensor(self.arr + self.maybe_unwrap(other))
-
-    def __radd__(self, other):
-        return NPTensor(self.arr + self.maybe_unwrap(other))
-
-    # def __iadd__(self, other):
-    #     self.arr += self.maybe_unwrap(other)
-    #     return  NPTensor(self.arr)
-
-    def __sub__(self, other):
-        return NPTensor(self.arr - self.maybe_unwrap(other))
-
-    def __rsub__(self, other):
-        return NPTensor(self.maybe_unwrap(other) - self.arr)
-
-    def __mul__(self, other):
-        return NPTensor(self.arr * self.maybe_unwrap(other))
-
-    def __rmul__(self, other):
-        return NPTensor(self.arr * self.maybe_unwrap(other))
-
-    def __pow__(self, other):
-        return NPTensor(self.arr ** self.maybe_unwrap(other))
-
-    def __rtruediv__(self, other):
-        return NPTensor(self.maybe_unwrap(other) / self.arr)
-
-    def __truediv__(self, other):
-        return NPTensor(self.arr / self.maybe_unwrap(other))
-
-    def __matmul__(self, other):
-        return NPTensor(self.arr @ self.maybe_unwrap(other))
-
-    def __gt__(self, other):
-        return NPTensor(self.arr > self.maybe_unwrap(other))
-
-    def view(self, shape):
-        # TODO: Add a test for the error case (it would be a numpy error, /should/ it be?)
-        # NB: np.view is the same as torch.view
-        # https://numpy.org/doc/stable/reference/generated/numpy.reshape.html
-        ret = self.arr.view()
-        ret.shape = shape
-        return NPTensor(ret)
-
-    def alias(self):
-        return NPTensor(self.arr.view())
-
-    def exp(self):
-        return NPTensor(np.exp(self.arr))
-
-    def sum(self, dims=None, keepdims=False):
-        # TODO: This not only handles sum_dim_IntList, but also dims=None
-        # Maybe there is a better way to deal with overloads?
-        assert isinstance(dims, List) or dims is None
-        if dims is None:
-            return NPTensor(np.sum(self.arr, keepdims=keepdims))
-        return NPTensor(np.sum(self.arr, axis=tuple(dims), keepdims=keepdims))
-
-    def squeeze(self, dim):
-        return NPTensor(self.arr.squeeze(dim))
-
-    def unsqueeze(self, dim):
-        return NPTensor(np.expand_dims(self.arr, dim))
-
-    def permute(self, perm: Tuple[int]):
-        # np.transpose is torch.permute when axes is specified
-        return NPTensor(np.transpose(self.arr, axes=perm))
-
-    def ones_like(self, dtype):
-        return NPTensor(np.ones_like(self.arr, dtype=torch_to_numpy_dtype_dict_int(dtype)))
-
-    def __repr__(self):
-        return repr(self.arr)
-
-    def publish(self, sigma=None):
-        # For PySyft
-        return self.arr
-
-    # Methods that are supposed to be on Tensor, but don't redispatch
-    # Our decompositions shouldn't really rely on these?
-
-    def numel(self):
-        return self.arr.size
-
-    def ndim(self):
-        return len(self.arr.shape)
-
-# conversion functions with dtype sserts
-def torch_to_numpy(t):
-    assert isinstance(t, torch.Tensor), f"Expected torch.Tensor, got: {type(t)}"
-    assert not isinstance(t, NPTensorWrapper)
-    ret = t.numpy()
-    assert ret.dtype.type == torch_to_numpy_dtype_dict[t.dtype]
-    return ret
-
-def numpy_to_torch(arr):
-    assert isinstance(arr, np.ndarray), f"Expected nd.array, got: {type(arr)}"  # What about scalars?
-    ret = torch.from_numpy(arr)
-    # dtype object actually encapsulates more information such as byte order, etc.
-    assert ret.dtype == numpy_to_torch_dtype_dict[arr.dtype.type]
-    return ret
-
-# 3) The subclass wrapping our mock backend
+# 3) Subclass Wrapper for Mock Backend
 
 class NPTensorWrapper(torch.Tensor):
     # Wrap the tensor-like interface in an actual tensor so that we can use autograd
@@ -365,13 +249,14 @@ class NPTensorWrapper(torch.Tensor):
 
         r = torch.Tensor._make_wrapper_subclass(  # type: ignore[attr-defined]
             cls,
-            pointer.public_shape(),
-            strides=contig_strides_from_shape(pointer.public_shape()),
+            pointer.arr.shape,
+            strides=torch.zeros(pointer.arr.shape).stride(),
             storage_offset=0,  # elem.storage_offset(),
             # TODO: clone storage aliasing
-            dtype=numpy_to_torch_dtype_dict[getattr(np, pointer.public_dtype())],
+            dtype=numpy_to_torch_dtype_dict[pointer.arr.dtype.type],
             layout=torch.strided,
             device="cpu",  # elem.device
+            # How does requires_grad work here?
             requires_grad=requires_grad
         )
         r.pointer = pointer
@@ -385,204 +270,252 @@ class NPTensorWrapper(torch.Tensor):
         def wrap(t):  # NPTensor -> NPTensorWrapper
             if isinstance(t, NPTensor):
                 return NPTensorWrapper(t)
-            elif isinstance(t, np.ndarray):
-                # assert func.__name__ in ("add_.Tensor", "addcmul_.default")
-                # return NPTensorWrapper(NPTensor(t))
-                assert False
             else:
                 return t
 
         def unwrap(t):  # NPTensorWrapper -> NPTensor, torch.Tensor -> np.ndarray
-            # NB: Adding a numpy array to NPTensor returns a NPTensor, the analog for this wrapper
-            #     is that users can add torch.Tensor to NPTensorWrapper and obtain NPTensorWrapper
             if isinstance(t, NPTensorWrapper):
                 return t.pointer
             elif isinstance(t, torch.Tensor):
-                return torch_to_numpy(t.detach())
+                # Why do we need to detach here?
+                ret = t.detach().numpy()
+                return ret
             else:
-                # assert False, f"We shouldn't reach here right? Got: type {type(t)}"
                 return t
 
-        # NPTensorWrapper -> torch.Tensor
-        def unwrap2(t):
-            return numpy_to_torch(t.pointer.arr) if isinstance(t, NPTensorWrapper) else t  # .to(dtype=torch.float32)
-
-        # torch.Tensor -> NPTensorWrapper
-        def wrap2(t):
-            return NPTensorWrapper(NPTensor(torch_to_numpy(t.detach()))) if isinstance(t, torch.Tensor) else t
-
-        # print([type(t) for t in args])
-        # print([t.dtype for t in args])
-
-        # Always run so that we can record for the test!
-        tensor_args = tree_map(unwrap2, args)
-        tensor_kwargs = tree_map(unwrap2, kwargs)
-
-        # print([t.dtype for t in tensor_args if isinstance(t, torch.Tensor)])
-
-        def detach_tensors(x):  # Avoid keeping the graph alive. But it also fails for other reasons (why?)
-            # assert isinstance(x, tuple) or isinstance(x, dict)
-            with no_dispatch():  # Cannot use this because we may have other subclasses like parameter!
-                if isinstance(x, tuple):  # Clone or else it breaks (does it still happen? and why?)
-                    return [t.clone().detach() if isinstance(t, torch.Tensor) else t for t in x]
-                elif isinstance(x, dict):
-                    return {k: (v.clone().detach() if isinstance(v, torch.Tensor) else v) for k, v in x.items()}
-                elif isinstance(x, torch.Tensor):
-                    return x.clone().detach()
-            return x
-
-        # Clone inputs before running func in case the operation is in-place
-        detached_args = detach_tensors(tensor_args)
-        detached_kwargs = detach_tensors(tensor_kwargs)
-
-        raw_out = func(*tensor_args, **tensor_kwargs)
-
-        detached_outs = detach_tensors(raw_out)
-        collect_example_run(func.__name__, detached_args, detached_kwargs, detached_outs)
-
-        try:
-            out = tree_map(wrap, all_funcs[func.__name__](*tree_map(unwrap, args), **tree_map(unwrap, kwargs)))
-        except KeyError as e:
-            out = None
-
-        # Fallback if necessary
-        return tree_map(wrap2, raw_out) if out is None else out
+        if func.__name__ in decompositions:
+            return decompositions[func.__name__](*args, **kwargs)
+        elif func.__name__ in np_tensor_backend_impl:
+            return tree_map(wrap, np_tensor_backend_impl[func.__name__](*tree_map(unwrap, args), **tree_map(unwrap, kwargs)))
+        else:
+            raise NotImplementedError(f"Backend has not implemented {func.__name__}")
 
     def __repr__(self):
-        # TODO: also print autograd information?
-        return repr(self.pointer)
+        return f"NPTensorWrapper(pointer={repr(self.pointer)}, requires_grad={self.requires_grad})"
 
-    # Non-tensor APIs from the backend to just forward
-    def synthetic(self):
-        return self.pointer.synthetic
-
-    def publish(self, sigma=1e5):
-        # We lose the graph though. TODO: find some way to reattach the graph?
-        return numpy_to_torch(self.pointer.publish(sigma=1e5))
+    def publish(self):
+        return numpy_to_torch(self.pointer.publish())
 
 
-# 4) Run through the XOR training example
+# 4) Testing
 
-import torch.nn as nn
-import torch.nn.functional as F
+def get_op_list(tested_op_list: List[Tuple]):
+    return [opinfo for opinfo in op_db if (opinfo.name, opinfo.variant_test_name) in tested_op_list]
 
-SIGMA = 0.4
-N_PER_QUAD = 100
-N_ITER = 100
+# Some testing utils from funtorch repo (test/common_utils.py)
 
-train_X_centers = [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]]
-train_y = [0, 1, 1, 0]
-
-shuffle_idx = np.arange(N_PER_QUAD * 4)
-np.random.shuffle(shuffle_idx)
-train_X_list = []
-train_y_list = []
-
-for center, label in zip(train_X_centers, train_y):
-    train_X_list.append(np.random.randn(N_PER_QUAD, 2) * SIGMA + np.array(center))
-    train_y_list.append(np.zeros(N_PER_QUAD) if label == 0 else np.ones(N_PER_QUAD))
-
-# Linear layer does not support double
-train_X_np = np.concatenate(train_X_list)[shuffle_idx].astype(np.float32)
-train_y_np = np.concatenate(train_y_list)[shuffle_idx].astype(np.float32)
-
-# Convert input data to torch.Tensor
-
-train_X = NPTensorWrapper(NPTensor(train_X_np))
-train_y = NPTensorWrapper(NPTensor(train_y_np))
-
-# 4.1) Simple MLP
-
-class Net(nn.Module):
-    def __init__(self):
-        super(Net, self).__init__()
-        self.linear1 = nn.Linear(2, 10)
-        self.linear2 = nn.Linear(10, 10)
-        self.linear3 = nn.Linear(10, 1)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        x = self.linear1(x)
-        x = self.relu(x)
-        x = self.linear2(x)
-        x = self.relu(x)
-        x = self.linear3(x)
-        return x.squeeze(1).sigmoid()
-
-# 4.2) Train
-
-model =  Net()
-sgd = torch.optim.Adam(model.parameters(), lr=1e-2)
-
-# Register hook that publishes gradients (unwraps)
-for p in model.parameters():
-    p.register_hook(lambda x: x.publish())
-
-losses = []
-for _ in range(N_ITER):
-    out = model(train_X)
-    loss = F.mse_loss(out, train_y)
-    loss.backward()
-    sgd.step()
-    sgd.zero_grad()
-    losses.append(loss.detach())
-
-# 4.3) Test
-
-test_X = torch.tensor([[-1., -1.], [-1., 1.], [1., -1.], [1., 1.]])
-test_y = torch.tensor([[0., 1., 1., 0.]])
-predicted = model(test_X)
-
-assert torch.allclose(predicted, test_y, atol=1e-2)
-print("\nTraining works! (Successfully predicted test set)\n")
-
-
-# 5) Test the functions in our backend using collected examples runs
-
-def nptensor_to_torch(t):
-    return numpy_to_torch(t.arr) if isinstance(t, NPTensor) else t  # .to(dtype=torch.float32)
-
-def torch_to_nptensor(t):
-    return NPTensor(torch_to_numpy(t.detach())) if isinstance(t, torch.Tensor) else t
-
-for name, func in all_funcs.items():
-    print(name)
-    if name in ("add.Tensor", "mul.Tensor", "exp.default",):
-        # TODO: xfail this
-        # These may be called indirectly
-        print("SKIP")
-        continue
-    example_runs = op_in_out_examples[name]
-    for name, input_args, input_kwargs, expected_outputs in example_runs:
-        raw_actual = func(*tree_map(torch_to_nptensor, input_args), **tree_map(torch_to_nptensor, input_kwargs))
-        torch_actual = tree_map(nptensor_to_torch, raw_actual)
-
-        expected_outputs = make_tuple(expected_outputs)
-        torch_actual = make_tuple(torch_actual)
-
-        assert len(expected_outputs) == len(torch_actual)
-
-        for expected, actual in zip(expected_outputs, torch_actual):
-            if isinstance(expected, torch.Tensor):
-                assert isinstance(actual, torch.Tensor)
-
-                if name in ("ones_like.default"):
-                    actual = actual.to(dtype=expected.dtype)
-
-                # Why such a high atol! TODO: op-specific atol? (e.g. for sigmoid_backward...)
-                assert torch.allclose(expected, actual, atol=3e-3), (
-                    f"Test failed for {name}:\n{expected = }, {actual =} "
-                    f"\n{input_args = }, {input_kwargs = }"
-                    f"\nMax difference: {(expected-actual).abs().max()}")
+def skipOps(test_case_name, base_test_name, to_skip):
+    all_opinfos = op_db
+    for xfail in to_skip:
+        op_name, variant_name, device_type, dtypes, expected_failure = xfail
+        matching_opinfos = [o for o in all_opinfos
+                            if o.name == op_name and o.variant_test_name == variant_name]
+        assert len(matching_opinfos) >= 1, f"Couldn't find OpInfo for {xfail}"
+        for opinfo in matching_opinfos:
+            decorators = list(opinfo.decorators)
+            if expected_failure:
+                decorator = DecorateInfo(unittest.expectedFailure,
+                                         test_case_name, base_test_name,
+                                         device_type=device_type, dtypes=dtypes)
+                decorators.append(decorator)
             else:
-                assert expected == actual, f"Expected {name} to return {expected} outputs, but got: {actual}"
-    print("OK!")
-print("\nTests Pass!")
+                decorator = DecorateInfo(unittest.skip("Skipped!"),
+                                         test_case_name, base_test_name,
+                                         device_type=device_type, dtypes=dtypes)
+                decorators.append(decorator)
+            opinfo.decorators = tuple(decorators)
 
-# List ops still using the fallback (e.g. that aren't supported by the backend)
+    # This decorator doesn't modify fn in any way
+    def wrapped(fn):
+        return fn
+    return wrapped
 
-print("\nList of ops that are using the fallback")
-for name in op_in_out_examples.keys():
-    if name in all_funcs:
-        continue
-    print(name)
+def xfail(op_name, variant_name='', *, device_type=None, dtypes=None):
+    return (op_name, variant_name, device_type, dtypes, True)
+
+class NPTensorTest(TestCase):
+
+    def nptensorwrapper_to_torch(self, t):
+        return numpy_to_torch(t.pointer.arr) if isinstance(t, NPTensorWrapper) else t
+
+    def torch_to_nptensorwrapper(self, t):
+        if isinstance(t, torch.Tensor):
+            return NPTensorWrapper(NPTensor(t.detach().numpy())).requires_grad_(t.requires_grad)
+        else:
+            return t
+
+   # 4.1) XOR Training Example
+
+    def test_train_XOR(self):
+        import torch.nn as nn
+        import torch.nn.functional as F
+
+        SIGMA = 0.4
+        N_PER_QUAD = 100
+        N_ITER = 100
+
+        train_X_centers = [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]]
+        train_y = [0, 1, 1, 0]
+
+        shuffle_idx = np.arange(N_PER_QUAD * 4)
+        np.random.shuffle(shuffle_idx)
+        train_X_list = []
+        train_y_list = []
+
+        for center, label in zip(train_X_centers, train_y):
+            train_X_list.append(np.random.randn(N_PER_QUAD, 2) * SIGMA + np.array(center))
+            train_y_list.append(np.zeros(N_PER_QUAD) if label == 0 else np.ones(N_PER_QUAD))
+
+        # Linear layer does not support double
+        train_X_np = np.concatenate(train_X_list)[shuffle_idx].astype(np.float32)
+        train_y_np = np.concatenate(train_y_list)[shuffle_idx].astype(np.float32)
+
+        # Convert input data to torch.Tensor
+
+        train_X = NPTensorWrapper(NPTensor(train_X_np))
+        train_y = NPTensorWrapper(NPTensor(train_y_np))
+
+        # Simple MLP
+
+        class Net(nn.Module):
+            def __init__(self):
+                super(Net, self).__init__()
+                self.linear1 = nn.Linear(2, 10)
+                self.linear2 = nn.Linear(10, 10)
+                self.linear3 = nn.Linear(10, 1)
+                self.relu = nn.ReLU()
+
+            def forward(self, x):
+                x = self.linear1(x)
+                x = self.relu(x)
+                x = self.linear2(x)
+                x = self.relu(x)
+                x = self.linear3(x)
+                return x.squeeze(1).sigmoid()
+
+        # Train
+
+        model =  Net()
+        sgd = torch.optim.Adam(model.parameters(), lr=1e-2)
+
+        # Register hook that publishes gradients (unwraps)
+        for p in model.parameters():
+            p.register_hook(lambda x: x.publish())
+
+        losses = []
+        for _ in range(N_ITER):
+            out = model(train_X)
+            loss = F.mse_loss(out, train_y)
+            loss.backward()
+            sgd.step()
+            sgd.zero_grad()
+            losses.append(loss.detach())
+
+        # Test
+
+        test_X = torch.tensor([[-1., -1.], [-1., 1.], [1., -1.], [1., 1.]])
+        test_y = torch.tensor([[0., 1., 1., 0.]])
+        predicted = model(test_X)
+
+        # TODO: Check if parameters have been updated
+        assert torch.allclose(predicted, test_y, atol=1e-2)
+
+
+    # 4.2) More Testing
+
+    @ops(op_list=get_op_list([
+        # Backend ops
+        ('sum',''),
+        ('add',''),
+        ('sub',''),
+        ('rsub',''),
+        ('div',''),
+        ('mul',''),
+
+        # Decompositions
+        ('sigmoid',''),
+        ('nn.functional.mse_loss',''),
+    ]), allowed_dtypes=(torch.float,))
+    @skipOps('NPTensorTest', 'test_np_tensor_parity', {
+        # Need to accept `alpha` param
+        xfail('add'),
+        xfail('sub'),
+
+        # We didn't implement a specific overload
+        xfail('rsub',''),  # need: rsub.Tensor
+    })
+    def test_np_tensor_parity(self, device, dtype, op):
+        # Tests if tensor and subclass tensor compute the same values
+        assert device == 'cpu' and  dtype == torch.float
+
+        samples = op.sample_inputs(device, dtype, requires_grad=False)
+
+        for sample in samples:
+            arg_values = [sample.input] + list(sample.args)
+            kwarg_values = sample.kwargs
+
+            subclass_arg_values = tree_map(self.torch_to_nptensorwrapper, arg_values)
+            subclass_kwarg_values = tree_map(self.torch_to_nptensorwrapper, kwarg_values)
+
+            fn = op.get_op()
+            result = self.nptensorwrapper_to_torch(fn(*subclass_arg_values, **subclass_kwarg_values))
+            expected = fn(*arg_values, **kwarg_values)
+            # print(result, expected, (result - expected).abs().max())
+            # print(arg_values)
+            self.assertTrue(torch.allclose(result, expected))
+
+    @ops(op_list=get_op_list([
+        # Backend ops
+        ('sum',''),
+        ('add',''),
+        ('sub',''),
+        ('div',''),
+        ('mul',''),
+
+        # Decompositions
+        ('sigmoid',''),
+        ('nn.functional.mse_loss',''),
+    ]), allowed_dtypes=(torch.float,))
+    @skipOps('NPTensorTest', 'test_np_tensor_gradients_parity', {
+        # Forward is already failing for these
+        xfail('add'),
+        xfail('sub'),
+        xfail('rsub',''),
+    })
+    def test_np_tensor_gradients_parity(self, device, dtype, op):
+        # Tests if tensor and subclass tensor compute the same gradient
+        assert device == 'cpu' and dtype == torch.float
+
+        samples = op.sample_inputs(device, dtype, requires_grad=True)
+
+        for sample in samples:
+            arg_values = [sample.input] + list(sample.args)
+            kwarg_values = sample.kwargs
+
+            subclass_arg_values = tree_map(self.torch_to_nptensorwrapper, arg_values)
+            subclass_kwarg_values = tree_map(self.torch_to_nptensorwrapper, kwarg_values)
+
+            fn = op.get_op()
+
+            subclass_out = fn(*subclass_arg_values, **subclass_kwarg_values)
+            out = fn(*arg_values, **kwarg_values)
+
+            assert isinstance(subclass_out, torch.Tensor), f"Expected op to return a single tensor, but got: {type(subclass_out)}"
+
+            grad_outputs = torch.rand_like(out)
+            subclass_grad_inputs = torch.autograd.grad(subclass_out, subclass_arg_values, grad_outputs=grad_outputs)
+            subclass_grad_inputs = tree_map(self.nptensorwrapper_to_torch, subclass_grad_inputs)
+
+            grad_inputs = torch.autograd.grad(out, arg_values, grad_outputs=grad_outputs)
+
+            self.assertEqual(len(subclass_grad_inputs), len(grad_inputs))
+
+            for subclass_grad_input, grad_input in zip(subclass_grad_inputs, grad_inputs):
+                # print(subclass_grad_input, grad_input, (subclass_grad_input - grad_input).abs().max())
+                # print(arg_values)
+                self.assertTrue(torch.allclose(grad_input, subclass_grad_input))
+
+instantiate_device_type_tests(NPTensorTest, globals(), only_for=("cpu,"))
+
+if __name__ == "__main__":
+    run_tests()
