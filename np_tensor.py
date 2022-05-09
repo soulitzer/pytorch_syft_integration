@@ -265,20 +265,17 @@ class NPTensorWrapper(torch.Tensor):
 
     @staticmethod
     def __new__(cls, pointer, requires_grad=False):
+        # Pretend to be a contiguous tensor on cpu
         assert isinstance(pointer, NPTensor)
-        # For logging tensor: "it should advertise the same device as before", but for
-        # this tensor was no previous device, so maybe just default to CPU?
-
         r = torch.Tensor._make_wrapper_subclass(  # type: ignore[attr-defined]
             cls,
             pointer.arr.shape,
             strides=torch.zeros(pointer.arr.shape).stride(),
-            storage_offset=0,  # elem.storage_offset(),
+            storage_offset=0,
             # TODO: clone storage aliasing
             dtype=numpy_to_torch_dtype_dict[pointer.arr.dtype.type],
             layout=torch.strided,
-            device="cpu",  # elem.device
-            # How does requires_grad work here?
+            device="cpu",
             requires_grad=requires_grad
         )
         r.pointer = pointer
@@ -289,18 +286,19 @@ class NPTensorWrapper(torch.Tensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        def wrap(t):  # NPTensor -> NPTensorWrapper
+        def wrap(t):
             if isinstance(t, NPTensor):
                 return NPTensorWrapper(t)
             else:
                 return t
 
-        def unwrap(t):  # NPTensorWrapper -> NPTensor, torch.Tensor -> np.ndarray
+        def unwrap(t):
             if isinstance(t, NPTensorWrapper):
                 return t.pointer
             elif isinstance(t, torch.Tensor):
-                # Why do we need to detach here?
-                ret = t.detach().numpy()
+                if t.requires_grad:
+                    t = t.detach()
+                ret = t.numpy()
                 return ret
             else:
                 return t
