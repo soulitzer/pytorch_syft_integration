@@ -1,12 +1,26 @@
 from typing import List, Tuple, Any
 import unittest
 from uuid import uuid1
-import time
-
 import numpy as np
+import copy
 
 import torch 
-from torch.testing._internal.common_utils import TestCase, run_tests, numpy_to_torch_dtype_dict
+from torch.testing._internal.common_utils import TestCase, run_tests
+
+numpy_to_torch_dtype_dict = {
+    np.bool_      : torch.bool,
+    np.uint8      : torch.uint8,
+    np.int8       : torch.int8,
+    np.int16      : torch.int16,
+    np.int32      : torch.int32,
+    np.int64      : torch.int64,
+    np.float16    : torch.float16,
+    np.float32    : torch.float32,
+    np.float64    : torch.float32,  # float64 -> float32
+    np.complex64  : torch.complex64,
+    np.complex128 : torch.complex128
+}
+
 from torch.testing._internal.common_device_type import ops, instantiate_device_type_tests
 from torch.testing._internal.common_methods_invocations import op_db, DecorateInfo
 from torch.utils._pytree import tree_map
@@ -17,10 +31,28 @@ sy.logger.remove()
 
 aten = torch.ops.aten
 
-# Mapping between aten ops and backend ops
-# This is where all the code would go to adapt the semantics of the 
-
 np_tensor_backend_impl = dict()
+
+def numpy_to_tensor_pointer(np_arr):
+    owner, user = syf_login()
+    backend_phi_tensor = sy.Tensor(np_arr)
+    assert np_arr.ndim != 0
+    data_subjects = ["abc"] * np_arr.shape[0] if np_arr.ndim != 0 else ["abc"]
+    single_data_subject = backend_phi_tensor.private(
+        min_val=10,
+        max_val=90,
+        data_subjects=data_subjects)
+    data_asset_name = str(uuid1())
+    owner.load_dataset(
+        assets={
+            data_asset_name: single_data_subject,
+        },
+        name="my_data",
+        description="description"
+    )
+    tensor_pointer = user.datasets[-1][data_asset_name]
+    assert isinstance(tensor_pointer, TensorWrappedPhiTensorPointer)
+    return tensor_pointer
 
 def register_func(name, ns):
     # Helpful decorator to colocate registration and definition
@@ -30,33 +62,10 @@ def register_func(name, ns):
         return f
     return register_func_inner
 
-# def fix_binary_type_promotion(f):
-#     # numpy and torch do binary type promotion differently
-#     expected_dtypes = (
-#         (np.int64, np.float32, np.float32),  # numpy promotes to np.float64
-#     )
-
-#     def check_dtype(x, y, lhs, rhs):
-#         # HACK: if lhs/rhs are int, make it a numpy array, so that we can check dtype
-#         # this might not be the right way to do it
-#         x = np.array(x) if isinstance(x, int) or isinstance(x, float) else maybe_unwrap(x)
-#         y = np.array(y) if isinstance(y, int) or isinstance(y, float) else maybe_unwrap(y)
-#         return x.dtype.type == lhs and y.dtype.type == rhs
-
-#     def wrapper(x, y):
-#         ret = f(x, y)
-#         for lhs, rhs, expected in expected_dtypes:
-#             if check_dtype(x, y, lhs, rhs) or check_dtype(y, x, lhs, rhs):
-#                 ret = NPTensor(ret.arr.astype(dtype=expected))
-#         return ret
-
-#     return wrapper
-
-# torch_to_numpy_dtype_dict = {v: k for k, v in numpy_to_torch_dtype_dict.items()}
-
 def torch_to_numpy_dtype_dict_int(dtype_int):
-    if dtype_int == 6:
-        return np.float32
+    # FIXME: Looks like this has been fixed by core, I don't think we need this anymore
+    if dtype_int == torch.float32:
+        return np.float64
     else:
         assert False, f"got: {dtype_int=}"
 
@@ -87,26 +96,18 @@ def np_tensor_mul_impl(x, y):  # @fix_binary_type_promotion
 def np_tensor_div_impl(x, y):  # @fix_binary_type_promotion
     return x / y
 
-# def np_tensor_pow_impl(x, a):
-#     ret = maybe_unwrap(x) ** maybe_unwrap(a)
-#     if x.arr.dtype.type == np.float32:
-#         # Correct type promotion to match torch
-#         ret = ret.astype(dtype=np.float32)
-#     return NPTensor(ret)
-
 @register_func(aten.sum.default, np_tensor_backend_impl)
 def np_tensor_sum_default_impl(x, keepdims=False):
-    print('np_tensor_sum_default_impl')
     assert not keepdims
     return x.sum()
 
-# @register_func(aten.sum.dim_IntList, np_tensor_backend_impl)
-# def np_tensor_sum_dim_IntList_impl(x, dims, keepdims=False):
-#     if x.arr.ndim == 0:
-#         ret = x.arr
-#     else:
-#         ret = np.sum(x.arr, axis=tuple(dims), keepdims=keepdims)
-#     return NPTensor(ret)
+@register_func(aten.sum.dim_IntList, np_tensor_backend_impl)
+def np_tensor_sum_dim_IntList_impl(x, dims, keepdims=False):
+    dims = (dims,) if isinstance(dims, int) else tuple(dims)
+    if len(dims) == 1 and x.public_shape[dims[0]] == 1 and keepdims:
+        return x + 0
+    np_tensor = x.publish(sigma=1e-4).block_with_timeout(10).get()
+    return numpy_to_tensor_pointer(np.sum(np_tensor, axis=dims, keepdims=keepdims))
 
 @register_func(aten.gt.Scalar, np_tensor_backend_impl)
 def np_tensor_gt_impl(x, y):
@@ -122,74 +123,82 @@ def np_tensor_exp_impl(x):
 
 @register_func(aten.mm.default, np_tensor_backend_impl)
 def np_tensor_mm_impl(x, y):
-    return x @ y
+    ret = x @ y
+    return ret
 
-# @register_func(aten.softmax.Tenso, np_tensor_backend_impl)
-# def np_tensor_softmax_impl(x):
-#     return x.softmax()
-
-print(np_tensor_backend_impl[aten.add.Tensor])
 # View Ops
 
-# @register_func(aten.view.default, np_tensor_backend_impl)
-# def np_tensor_view_impl(x, shape):
-#     ret = x.arr.view()
-#     ret.shape = shape
-#     return NPTensor(ret)
+@register_func(aten.view.default, np_tensor_backend_impl)
+def np_tensor_view_impl(x, shape):
+    if x.public_shape == shape:
+        return x
+    np_tensor = x.publish(sigma=1e-4).block_with_timeout(10).get()
+    ret = np_tensor.view()
+    ret.shape = shape
+    return numpy_to_tensor_pointer(ret)
 
-# @register_func(aten.permute.default, np_tensor_backend_impl)
-# def np_tensor_permute_impl(x, perm):
-#     return NPTensor(np.transpose(x.arr, axes=perm))
+@register_func(aten.expand.default, np_tensor_backend_impl)
+def np_tensor_expand_impl(x, out_size):
+    # FIXME: we don't have views yet, so just make a new tensor for now
+    np_tensor = x.publish(sigma=1e-4).block_with_timeout(10).get()
+    return numpy_to_tensor_pointer(np.broadcast_to(np_tensor, out_size))
 
-# @register_func(aten.pow.Tensor_Scalar, np_tensor_backend_impl)
+@register_func(aten.t.default, np_tensor_backend_impl)
+def np_tensor_t_impl(x):
+    # Question: This is a view?
+    return x.T
 
-# @register_func(aten.squeeze.dim, np_tensor_backend_impl)
-# def np_tensor_squeeze_impl(x, dim):
-#     return NPTensor(x.arr.squeeze(dim))
+@register_func(aten.detach.default, np_tensor_backend_impl)
+def np_tensor_detach_impl(x):
+    # To the backend, detach is simply a view (FIXME: but we don't have views yet
+    # so, just do a "clone" because the shape is the same)
+    return x + 0
 
-# @register_func(aten.unsqueeze.default, np_tensor_backend_impl)
-# def np_tensor_unsqueeze_impl(x, dim):
-#     return NPTensor(np.expand_dims(x.arr, dim))
+# Casting ops
 
-# @register_func(aten.detach.default, np_tensor_backend_impl)
-# def np_tensor_detach_impl(x):
-#     # To the backend, detach is simply a view
-#     return NPTensor(x.arr.view())
+@register_func(aten._to_copy.default, np_tensor_backend_impl)
+def np_tensor__to_copy_impl(x, dtype):
+    return x + 0  # FIXME: cast -> clone
 
-# Factory functions
+# Factory ops
 
-# @register_func(aten.ones_like.default, np_tensor_backend_impl)
-# def np_tensor_ones_like_impl(x, dtype, layout, device, pin_memory, memory_format):
-#     # TODO: do we care about the other arguments
-#     return NPTensor(np.ones_like(x.arr, dtype=torch_to_numpy_dtype_dict_int(dtype)))
+@register_func(aten.ones_like.default, np_tensor_backend_impl)
+def np_tensor_ones_like_impl(x, dtype, layout, device, pin_memory, memory_format):
+    # FIXME: factory functions - just make a new tensor? (this should be handled by backend)
+    np_tensor = x.publish(sigma=1e-4).block_with_timeout(10).get()
+    if len(np_tensor.shape) == 0:
+        # This is weird, public shape is not a scalar, but after publishing we get a scalar
+        np_tensor = np.broadcast_to(np_tensor, (1,))
+    return numpy_to_tensor_pointer(np.ones_like(np_tensor, dtype=torch_to_numpy_dtype_dict_int(dtype)))
 
-# Casting
+decompositions = dict()
 
-# @register_func(aten.to.dtype, np_tensor_backend_impl)
-# def np_tensor_to_dtype_impl(x, dtype):
-#     # To the backend, detach is simply a view
-#     ret = x.arr.astype(dtype=torch_to_numpy_dtype_dict_int(dtype))
-#     return NPTensor(ret)
+@register_func(aten.relu.default, decompositions)
+def relu(x):
+    return x * (x > 0)
 
-# (Optional) For l1 loss (instead of mse loss)
+@register_func(aten.addmm.default, decompositions)
+def addmm(bias, a, b):
+    return torch.mm(a, b) + bias
 
-# @register_func(aten.abs.default, np_tensor_backend_impl)
-# def np_tensor_abs_default_impl(x):
-#     return NPTensor(np.abs(x.arr))
+@register_func(aten.sigmoid.default, decompositions)
+def sigmoid(x):
+    return 1 / (1 + torch.exp(x * -1))
 
-# @register_func(aten.mean.default, np_tensor_backend_impl)
-# def np_tensor_mean_default_impl(x):
-#     return NPTensor(np.mean(x.arr))
+@register_func(aten.sigmoid_backward.default, decompositions)
+def sigmoid_backward(grad_out, result):
+    # FIXME: DPTensor needs to be on the LHS always?
+    return grad_out * result * (result * -1 + 1)
 
-# @register_func(aten.sign.default, np_tensor_backend_impl)
-# def np_tensor_mean_default_impl(x):
-#     return NPTensor(np.sign(x.arr))
+@register_func(aten.threshold_backward.default, decompositions)
+def threshold_backward(grad_out, self, threshold):
+    return grad_out * (self > threshold)
 
 def contig_strides_from_shape(shape):
     return torch.zeros(shape).stride()
 
 class DPTensor(torch.Tensor):
-    # This class wraps a TensorPointer so autograd can be used
+    # This class wraps a TensorPointer so autograd, and other can be used
     #
     # TODO:
     # - Think about the gamma case
@@ -218,6 +227,7 @@ class DPTensor(torch.Tensor):
     
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        print(f"__torch_dispatch__: {func.__module__}.{func.__name__}")
         def wrap(t):
             if isinstance(t, TensorWrappedPhiTensorPointer):
                 return DPTensor(t)
@@ -231,12 +241,21 @@ class DPTensor(torch.Tensor):
                 return t.pointer
             elif isinstance(t, torch.Tensor):
                 # Sometimes we get tensors (either because autograd creates tensors internally)
-                #.or scalars get wrapped into tensors - wrapped number
-                return t.numpy()
-            else:
-                assert False
-
-        return tree_map(wrap, np_tensor_backend_impl[func](*tree_map(unwrap, args), **tree_map(unwrap, kwargs)))
+                # or scalars get wrapped into tensors - wrapped number
+                return t.detach().numpy()
+            else:  # int, torch.dtype, etc? (we should have an explicit white-list)
+                return t
+            # else:
+            #     assert False, f"Unsupported type: {type(t)}"
+        if func in np_tensor_backend_impl:
+            rets = tree_map(wrap, np_tensor_backend_impl[func](*tree_map(unwrap, args), **tree_map(unwrap, kwargs)))
+            # get_logging_tensor_handler().emit(func.__name__, args, kwargs, rets)
+            # print('\n'.join(get_logging_tensor_handler().log_list))
+            return rets
+        elif func in decompositions:
+            return decompositions[func](*args, **kwargs)
+        else:
+            raise NotImplementedError(f"Backend has not implemented {func.__module__}.{func.__name__}")
 
     def __repr__(self):
         # TODO: maybe we should include autograd information?
@@ -246,7 +265,8 @@ class DPTensor(torch.Tensor):
         return self.pointer.synthetic
     
     def publish(self, sigma=None):
-        return self.pointer.publish(sigma=sigma)
+        ret = torch.from_numpy(self.pointer.publish(sigma=sigma).block_with_timeout(10).get()).to(self.dtype).reshape(self.shape)
+        return ret
     
 # 4) Testing
 
@@ -325,32 +345,10 @@ class NPTensorTest(TestCase):
         # There will be noise!
         owner, user = syf_login()
         before = user.privacy_budget
-        np_arr = t.publish(sigma=sigma).block_with_timeout(10).get()
+        ret = t.publish(sigma=sigma)
         after = user.privacy_budget
         assert before - after > 1
-        assert isinstance(np_arr, np.ndarray)
-        return numpy_to_torch(np_arr)
-
-    def numpy_to_tensor_pointer(self, np_arr):
-        owner, user = syf_login()
-        backend_phi_tensor = sy.Tensor(np_arr)
-        assert np_arr.ndim != 0
-        data_subjects = ["abc"] * np_arr.shape[0] if np_arr.ndim != 0 else ["abc"]
-        single_data_subject = backend_phi_tensor.private(
-            min_val=10,
-            max_val=90,
-            data_subjects=data_subjects)
-        data_asset_name = str(uuid1())
-        owner.load_dataset(
-            assets={
-                data_asset_name: single_data_subject,
-            },
-            name="my_data",
-            description="description"
-        )
-        tensor_pointer = user.datasets[-1][data_asset_name]
-        assert isinstance(tensor_pointer, TensorWrappedPhiTensorPointer)
-        return tensor_pointer
+        return ret
 
     def wrap_samples_with_subclass(self, samples):
         # Given OpInfo sample, reproduce sample, but with arguments wrapped
@@ -416,101 +414,106 @@ class NPTensorTest(TestCase):
                 # FIXME: float32 is not supported by Syft
                 t = t.to(torch.float64)
             np_arr = t.detach().numpy()
-            tensor_pointer = self.numpy_to_tensor_pointer(np_arr)
+            tensor_pointer = numpy_to_tensor_pointer(np_arr)
             return DPTensor(tensor_pointer).requires_grad_(t.requires_grad)
         else:
             return t
 
-    # def test_conversion(self):
-    #     # NB: cannot be scalar, dtype must be float64, int64, or bool
-    #     t = torch.tensor([100.], dtype=torch.float64)
-    #     wrapped = self.torch_to_nptensorwrapper(t)
-    #     t_back = self.nptensorwrapper_to_torch(wrapped)
-    #     self.assertTrue(torch.allclose(t, t_back, atol=10))
-
-    # def test_dtypes(self):
-    #     # Only float64 (and int64 and bool) are allowed
-    #     pass
-
-    # def test_broadcasting(self):
-    #     pass
-
    # 4.1) XOR Training Example
 
-    # def test_train_XOR(self):
-    #     import torch.nn as nn
-    #     import torch.nn.functional as F
+    def test_train_XOR(self):
+        import torch.nn as nn
+        import torch.nn.functional as F
 
-    #     SIGMA = 0.4
-    #     N_PER_QUAD = 100
-    #     N_ITER = 100
+        SIGMA = 0.4
+        N_PER_QUAD = 100
+        N_ITER = 2
 
-    #     train_X_centers = [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]]
-    #     train_y = [0, 1, 1, 0]
+        train_X_centers = [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]]
+        train_y = [0, 1, 1, 0]
 
-    #     shuffle_idx = np.arange(N_PER_QUAD * 4)
-    #     np.random.shuffle(shuffle_idx)
-    #     train_X_list = []
-    #     train_y_list = []
+        shuffle_idx = np.arange(N_PER_QUAD * 4)
+        np.random.shuffle(shuffle_idx)
+        train_X_list = []
+        train_y_list = []
 
-    #     for center, label in zip(train_X_centers, train_y):
-    #         train_X_list.append(np.random.randn(N_PER_QUAD, 2) * SIGMA + np.array(center))
-    #         train_y_list.append(np.zeros(N_PER_QUAD) if label == 0 else np.ones(N_PER_QUAD))
+        for center, label in zip(train_X_centers, train_y):
+            train_X_list.append(np.random.randn(N_PER_QUAD, 2) * SIGMA + np.array(center))
+            train_y_list.append(np.zeros(N_PER_QUAD) if label == 0 else np.ones(N_PER_QUAD))
 
-    #     # Linear layer does not support double
-    #     train_X_np = np.concatenate(train_X_list)[shuffle_idx].astype(np.float32)
-    #     train_y_np = np.concatenate(train_y_list)[shuffle_idx].astype(np.float32)
+        # Linear layer does not support double
+        train_X_np = np.concatenate(train_X_list)[shuffle_idx].astype(np.float64)
+        train_y_np = np.concatenate(train_y_list)[shuffle_idx].astype(np.float64)
 
-    #     # Convert input data to torch.Tensor
+        # Convert input data to torch.Tensor
+        train_X = DPTensor(numpy_to_tensor_pointer(train_X_np))
+        train_y = DPTensor(numpy_to_tensor_pointer(train_y_np))
 
-    #     train_X = NPTensorWrapper(NPTensor(train_X_np))
-    #     train_y = NPTensorWrapper(NPTensor(train_y_np))
+        # Simple MLP
 
-    #     # Simple MLP
+        class Net(nn.Module):
+            def __init__(self):
+                super(Net, self).__init__()
+                self.linear1 = nn.Linear(2, 10)
+                self.linear2 = nn.Linear(10, 1)
+                self.relu = nn.ReLU()
 
-    #     class Net(nn.Module):
-    #         def __init__(self):
-    #             super(Net, self).__init__()
-    #             self.linear1 = nn.Linear(2, 10)
-    #             self.linear2 = nn.Linear(10, 10)
-    #             self.linear3 = nn.Linear(10, 1)
-    #             self.relu = nn.ReLU()
-    #             self.gelu = nn.GELU()
+            def forward(self, x):
+                x = self.linear1(x)
+                x = self.relu(x)
+                x = self.linear2(x)
+                x = self.relu(x)
+                return x.sigmoid()
 
-    #         def forward(self, x):
-    #             x = self.linear1(x)
-    #             x = self.relu(x)
-    #             x = self.linear2(x)
-    #             x = self.relu(x)
-    #             x = self.linear3(x)
-    #             return x.squeeze(1).sigmoid()
+        # Train
 
-    #     # Train
+        model =  Net()
+        sgd = torch.optim.Adam(model.parameters(), lr=1e-2)
 
-    #     model =  Net()
-    #     sgd = torch.optim.Adam(model.parameters(), lr=1e-2)
+        # Register hook that publishes gradients (unwraps)
+        for p in model.parameters():
+            p.register_hook(lambda x: x.publish(sigma=1e-4))
 
-    #     # Register hook that publishes gradients (unwraps)
-    #     for p in model.parameters():
-    #         p.register_hook(lambda x: x.publish())
+        # For testing only
+        model_copy = copy.deepcopy(model)
+        train_X_tensor = torch.from_numpy(train_X_np).to(torch.float32)
+        train_y_tensor = torch.from_numpy(train_y_np).to(torch.float32)
+        old_params = [p.clone().detach() for p in model.parameters()]
+        losses = []
 
-    #     losses = []
-    #     for _ in range(N_ITER):
-    #         out = model(train_X)
-    #         loss = F.l1_loss(out, train_y)
-    #         loss.backward()
-    #         sgd.step()
-    #         sgd.zero_grad()
-    #         losses.append(loss.detach())
+        # Training loop
+        for i in range(N_ITER):
+            print("ITER: ", i)
+            out = model(train_X)
+            loss = (out - train_y).sum()
+            loss.backward()
 
-    #     # Test
+            # Testing computed gradients are the same
+            out1 = model_copy(train_X_tensor)
+            loss1 = (out1 - train_y_tensor).sum()
+            loss1.backward()
+            if i == 0:
+                for p1, p2 in zip(model.parameters(), model_copy.parameters()):
+                    assert torch.allclose(p1.grad, p2.grad, atol=3e-2, rtol=3e-2)
 
-    #     test_X = torch.tensor([[-1., -1.], [-1., 1.], [1., -1.], [1., 1.]])
-    #     test_y = torch.tensor([[0., 1., 1., 0.]])
-    #     predicted = model(test_X)
+            sgd.step()
+            sgd.zero_grad()
+            losses.append(loss.detach())
 
-    #     # TODO: Check if parameters have been updated
-    #     assert torch.allclose(predicted, test_y, atol=1e-2)
+        # Test parameters have been updated
+        for p1, p2 in zip(old_params, model.parameters()):
+            assert not torch.allclose(p1, p2)
+
+        # Run test set
+
+        test_X = torch.tensor([[-1., -1.], [-1., 1.], [1., -1.], [1., 1.]])
+        test_y = torch.tensor([[0., 1., 1., 0.]])
+        predicted = model(test_X)
+
+        # Check whether we predictions are good
+        # FIXME: currently runs too slow (need about 200 iter to reliably predict)
+
+        # assert torch.allclose(predicted, test_y, atol=1e-2)
 
 
     # 4.2) Op Testing
@@ -518,11 +521,12 @@ class NPTensorTest(TestCase):
     @ops(op_list=get_op_list([
         # Backend ops
         # ('sum',''),  # int dim list?
-        # ('add',''),
-        # ('sub',''),
+        ('add',''),
+        ('sub',''),
         # ('rsub',''),
-        # ('div',''),
+        ('div',''),
         ('mul',''),
+        ('exp',''),
         # Decompositions
         # ('softmax',''),
         # ('nn.functional.mse_loss',''),
@@ -532,6 +536,7 @@ class NPTensorTest(TestCase):
         # Need to accept `alpha` param
         xfail('add'),
         xfail('sub'),
+        xfail('exp'),  # FIXME: This is weird - result off by 20 even when sigma is 1e-4!
         # We didn't implement a specific overload
         xfail('rsub',''),  # need: rsub.Tensor
     })
@@ -543,7 +548,7 @@ class NPTensorTest(TestCase):
         samples = list(op.sample_inputs(device, dtype, requires_grad=False))
 
         def supported_by_syft(sample):
-            element_wise_ops = "add sub rsub div mul".split(" ")
+            element_wise_binary_ops = "add sub rsub div mul".split(" ")
             arg_values = [sample.input] + list(sample.args)
             kwarg_values = sample.kwargs
             if any(t.numel() == 0 for t in arg_values if isinstance(t, torch.Tensor)) or \
@@ -554,7 +559,7 @@ class NPTensorTest(TestCase):
                 any(t.ndim == 0 for t in kwarg_values.values() if isinstance(t, torch.Tensor)):
                 # FIXME: Scalar errors (data subject issue?)
                 return False
-            if op.name in element_wise_ops and arg_values[0].shape[0] != arg_values[1].shape[0]:
+            if op.name in element_wise_binary_ops and arg_values[0].shape[0] != arg_values[1].shape[0]:
                 # FIXME: element-wise op when data_subjects_indexed arrays are differently shaped
                 return False
             return True
@@ -562,8 +567,8 @@ class NPTensorTest(TestCase):
         samples = list(filter(supported_by_syft, samples))
         wrapped_samples = self.wrap_samples_with_subclass(samples)
         for wrapped_sample, sample in zip(wrapped_samples, samples):
-            print("Sample: ", sample)
-            print("Wrapped sample: ", wrapped_sample)
+            # print("Sample: ", sample)
+            # print("Wrapped sample: ", wrapped_sample)
             # Wrapped
             wrapped_args, wrapped_kwargs = wrapped_sample
             fn = op.get_op()
@@ -574,10 +579,10 @@ class NPTensorTest(TestCase):
             arg_values = [sample.input] + list(sample.args)
             kwarg_values = sample.kwargs
             expected = fn(*arg_values, **kwarg_values)
-            # print(result, expected, (result - expected).abs().max())
+            print(result, expected, (result - expected).abs().max())
             # print(arg_values)
 
-            self.assertTrue(_allclose_with_type_promotion(result, expected, rtol=1e-3, atol=1e-1))
+            self.assertTrue(_allclose_with_type_promotion(result, expected, rtol=1e-1, atol=1e-2))
 
     # @ops(op_list=get_op_list([
     #     # Backend ops
